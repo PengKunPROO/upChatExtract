@@ -461,7 +461,8 @@ class TestRunOnce(unittest.TestCase):
         state = default_state()
         c_new = self._c("1", cutoff + 3600, "new")
         with patch("monitor.fetch_up_comments", return_value=[c_new]), \
-             patch("monitor.send_feishu", return_value=True) as mock_send:
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.save_state"):
             run_once(self.cfg, state, "121")
             self.assertIn("1", state["pushed_ids"])
             sent = [c for c in mock_send.call_args_list if "新评论" in str(c[0][1])]
@@ -473,7 +474,8 @@ class TestRunOnce(unittest.TestCase):
         old = self._c("1", now - 1200, "old")
         new = self._c("2", now - 100, "new")
         with patch("monitor.fetch_up_comments", return_value=[old, new]), \
-             patch("monitor.send_feishu", return_value=True) as mock_send:
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.save_state"):
             run_once(self.cfg, state, "121")
             sent = [c for c in mock_send.call_args_list if "新评论" in str(c[0][1])]
             self.assertEqual(len(sent), 1)

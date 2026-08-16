@@ -97,7 +97,8 @@ class TestRefererDesensitization(unittest.TestCase):
         }
         state = default_state()
         with patch("monitor.fetch_up_comments", return_value=[]) as mock_f, \
-             patch("monitor.send_feishu"):
+             patch("monitor.send_feishu"), \
+             patch("monitor.save_state"):
             run_once(cfg, state, "121")
             self.assertEqual(mock_f.call_args.kwargs.get("opus_id"), "121")
 

@@ -117,6 +117,10 @@ def interactive_setup(path=None, input_fn=input, output_fn=print):
         "push_interval": 2,
         "fast_interval": 60,
         "slow_interval": 300,
+        "poll_start_hour": 9,
+        "poll_end_hour": 15,
+        "poll_weekday_only": True,
+        "overlap_seconds": 1800,
         "bilibili": {"sessdata": sessdata or "<未填写>"},
         "feishu": {"webhook": webhook or "<未填写>"},
     }
@@ -366,7 +370,7 @@ def fetch_sub_replies(sessdata, comment_id, root_rpid, up_uid, threshold_ts, max
     return results
 
 
-def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=3, opus_id=None):
+def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=5, opus_id=None):
     """新版 reply/main 接口拉一级评论（含 top_replies）+ 楼中楼接口拉子回复。"""
     results = []
     next_cursor = 0
@@ -528,7 +532,14 @@ def run_once(cfg, state, comment_id):
         threshold = int(_time.time()) - cfg["history_days"] * 86400
         log.info("冷启动：回溯 %d 天，阈值 %s", cfg["history_days"], threshold)
     else:
-        threshold = state["last_poll_ts"]
+        # 回看 overlap 窗口：B站评论 API 有可见性延迟（秒~分钟级），
+        # 刚发布的评论可能下一轮才出现，用 last_poll_ts 原值会把
+        # ctime 早于它的评论永久过滤掉。靠 pushed_ids 去重防重推。
+        overlap = cfg.get("overlap_seconds", 1800)
+        threshold = state["last_poll_ts"] - overlap
+        log.info(
+            "热启动：阈值 %s（回看 %d 秒）", threshold, overlap
+        )
 
     try:
         comments = fetch_up_comments(
@@ -578,21 +589,56 @@ def run_once(cfg, state, comment_id):
     save_state(state)
 
 
-def get_poll_interval(cfg):
-    """交易时段（周一至周五 9:00-15:00）快轮询，其他时段慢轮询。"""
+def get_poll_interval(cfg, now=None):
+    """活跃时段（默认工作日 9:00-15:00）快轮询，其余时段慢轮询。
+
+    时段与节奏全部可配置（config.yaml）：
+      poll_start_hour / poll_end_hour  活跃时段起止小时（默认 9 / 15）
+      poll_weekday_only                仅工作日快轮询（默认 true）
+      fast_interval / slow_interval    快/慢轮询间隔秒数（默认 60 / 300）
+    """
     import datetime
 
-    now = datetime.datetime.now()
-    trading_hours = cfg.get("trading_hours", {"start": 9, "end": 15})
+    if now is None:
+        now = datetime.datetime.now()
+    start = cfg.get("poll_start_hour", 9)
+    end = cfg.get("poll_end_hour", 15)
+    weekday_only = cfg.get("poll_weekday_only", True)
     fast = cfg.get("fast_interval", 60)
     slow = cfg.get("slow_interval", 300)
 
-    is_weekday = now.weekday() < 5  # 0=Mon ... 4=Fri
-    in_trading = (
-        is_weekday
-        and trading_hours["start"] <= now.hour < trading_hours["end"]
-    )
-    return fast if in_trading else slow
+    in_active = start <= now.hour < end
+    if weekday_only and now.weekday() >= 5:
+        in_active = False
+    return fast if in_active else slow
+
+
+def _disable_quick_edit():
+    """Windows 下禁用控制台 QuickEdit 模式。
+
+    双击运行 exe 的控制台默认开启 QuickEdit：用户点击窗口选中文字会
+    冻结整个进程（表现为"程序卡死/不再推送"，需重启）。禁用后点击
+    窗口不再冻结；复制请用右键->标记以外的 Ctrl+Shift+C 或窗口菜单。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        STD_INPUT_HANDLE = -10
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        if not handle or handle == ctypes.c_void_p(-1).value:
+            return
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        kernel32.SetConsoleMode(handle, new_mode)
+    except Exception:
+        pass  # 非交互控制台（管道/服务）下失败不影响功能
 
 
 def _force_utf8_console():
@@ -609,13 +655,21 @@ def _force_utf8_console():
 
 def main():
     _force_utf8_console()
+    _disable_quick_edit()
     setup_logging()
     log.info("========== 启动 ==========")
     if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
-        print("用法: python monitor.py [--setup] [--help]")
-        print("  （无参数）  开始监控，config.yaml 不存在时自动进入首次配置向导")
-        print("  --setup    重新运行配置向导")
+        print("用法: python monitor.py [--config] [--setup] [--help]")
+        print("  （无参数）  开始监控，config.yaml 不存在时自动打开配置窗口")
+        print("  --config   打开图形配置窗口（保存后开始监控）")
+        print("  --setup    运行终端配置向导（无人值守场景）")
         print("  --help     显示本帮助")
+        return
+    if "--config" in sys.argv[1:]:
+        _open_config_editor()
+        cfg = load_config()
+        state = load_state()
+        _run_loop(cfg, state)
         return
     if "--setup" in sys.argv[1:]:
         interactive_setup()
@@ -624,12 +678,30 @@ def main():
         cfg = load_config()
     except ConfigError as e:
         log.warning("%s", e)
-        log.info("未找到有效配置，进入首次配置向导...")
-        if not interactive_setup():
-            log.info("未完成配置，退出。可运行 python monitor.py --setup 重新配置")
+        log.info("未找到有效配置，打开配置窗口...")
+        if not _open_config_editor():
+            log.info("未完成配置，退出。可运行程序加 --config 参数重新配置")
             return
         cfg = load_config()
     state = load_state()
+    _run_loop(cfg, state)
+
+
+def _open_config_editor():
+    """优先打开图形配置窗口；tkinter 不可用时回退终端向导。
+
+    返回 True 表示配置已就绪。
+    """
+    try:
+        import config_gui
+
+        return config_gui.open_config_window()
+    except ImportError:
+        log.warning("图形界面不可用（缺少 tkinter），改用终端向导")
+        return interactive_setup()
+
+
+def _run_loop(cfg, state):
     try:
         comment_id = resolve_comment_id(cfg["opus_id"])
         log.info("opus=%s -> comment_id=%s", cfg["opus_id"], comment_id)
@@ -637,8 +709,11 @@ def main():
         log.error("解析 comment_id 失败: %s，将在循环中重试", e)
         comment_id = None
     log.info(
-        "监控 up_uid=%s 交易时段=%ds 非交易=%ds 冷启动=%s",
+        "监控 up_uid=%s 活跃时段=%d-%d点(仅工作日=%s) 快轮询=%ds 慢轮询=%ds 冷启动=%s",
         cfg["up_uid"],
+        cfg.get("poll_start_hour", 9),
+        cfg.get("poll_end_hour", 15),
+        cfg.get("poll_weekday_only", True),
         cfg.get("fast_interval", 60),
         cfg.get("slow_interval", 300),
         state["last_poll_ts"] == 0,

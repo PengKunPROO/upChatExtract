@@ -7,14 +7,21 @@
 ## 快速开始（最简单：直接下载 exe）
 
 1. 到本仓库 [Releases](../../releases) 页面下载最新版 `up-chat-monitor.exe`
-2. 双击运行，首次启动会进入**交互式配置向导**，按提示填写 4 项信息：
-   - **opus ID**：动态页 `https://www.bilibili.com/opus/<这串数字>`
-   - **up_uid**：UP主主页 `https://space.bilibili.com/<这串数字>`
+2. 双击运行，首次启动会**自动打开图形配置窗口**，按提示填写 4 项信息：
+   - **动态 opus ID**：动态页 `https://www.bilibili.com/opus/<这串数字>`
+   - **UP主 mid**：UP主主页 `https://space.bilibili.com/<这串数字>`
    - **SESSDATA**：见下方"获取 B 站 SESSDATA"
    - **飞书 webhook**：见下方"创建飞书群机器人"
-3. 配置保存后自动开始监控，`Ctrl+C` 安全退出
+   - 轮询间隔、活跃时段等高级项有默认值，可直接保存
+3. 点"保存并开始监控"后，控制台窗口开始监控，`Ctrl+C` 安全退出
 
-配置文件 `config.yaml`、运行状态 `state.json`、日志 `monitor.log` 都生成在 exe 同目录。
+配置文件 `config.yaml`、运行状态 `state.json`、日志 `monitor.log` 都生成在 exe 同目录，重启/关机后配置保留，无需重新填写。
+
+### 修改配置
+
+- **图形界面**：`up-chat-monitor.exe --config`（或删除 `config.yaml` 后双击运行）
+- **终端向导**：`up-chat-monitor.exe --setup`
+- **手动编辑**：直接编辑 exe 同目录的 `config.yaml`
 
 ## 获取 B 站 SESSDATA（Cookie）
 
@@ -38,8 +45,9 @@
 
 ```bash
 pip install -r requirements.txt
-python monitor.py          # 首次运行自动进入配置向导
-python monitor.py --setup  # 重新配置
+python monitor.py              # 首次运行自动打开配置窗口
+python monitor.py --config     # 打开图形配置窗口
+python monitor.py --setup      # 终端配置向导（无人值守场景）
 python monitor.py --help
 ```
 
@@ -61,11 +69,15 @@ pyinstaller --noconfirm --clean --onefile --console --name up-chat-monitor monit
 ```yaml
 opus_id: "<opus静态ID>"         # 监控的动态 ID
 up_uid: "<UP主的mid>"           # UP主的用户 ID
-poll_interval: 180              # 轮询间隔，秒
+poll_interval: 180              # 轮询间隔，秒（保留字段）
 history_days: 3                 # 冷启动回溯天数
 push_interval: 2                # 连续推送间隔，秒
-fast_interval: 60               # 工作日 9:00-15:00 的快轮询间隔
-slow_interval: 300              # 其余时段的慢轮询间隔
+fast_interval: 60               # 活跃时段的快轮询间隔，秒
+slow_interval: 300              # 其余时段的慢轮询间隔，秒
+poll_start_hour: 9              # 活跃时段开始（小时，24 小时制）
+poll_end_hour: 15               # 活跃时段结束（小时）
+poll_weekday_only: true         # true=仅工作日启用快轮询
+overlap_seconds: 1800           # 防漏推回看窗口，秒（B站接口有可见性延迟）
 
 bilibili:
   sessdata: "<你的SESSDATA>"    # 敏感，请勿公开/提交
@@ -98,6 +110,7 @@ feishu:
 | 文件 | 说明 |
 |------|------|
 | `monitor.py` | 主程序：配置、抓取、过滤、推送、主循环 |
+| `config_gui.py` | 图形配置编辑器（tkinter，`--config` 打开） |
 | `cdp_extract.py` | 实验性调试工具（用 Edge CDP 打开页面提取评论），日常使用不需要 |
 | `config.example.yaml` | 配置模板，不含敏感值 |
 | `config.yaml` | 实际配置（含 cookie，已被 gitignore，请勿提交） |

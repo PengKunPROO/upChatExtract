@@ -5,6 +5,10 @@ history_days: 1
 push_interval: 2
 fast_interval: 60
 slow_interval: 300
+poll_start_hour: 9
+poll_end_hour: 15
+poll_weekday_only: true
+overlap_seconds: 1800
 
 bilibili:
   sessdata: "<从浏览器F12->Application->Cookies->bilibili.com复制SESSDATA>"

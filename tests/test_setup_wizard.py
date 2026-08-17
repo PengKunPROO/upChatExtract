@@ -39,6 +39,7 @@ class TestInteractiveSetup(unittest.TestCase):
             self.assertEqual(cfg["bilibili"]["sessdata"], "sess123")
             self.assertEqual(cfg["feishu"]["webhook"], "https://open.feishu.cn/hook/x")
             self.assertEqual(cfg["poll_interval"], 180)
+            self.assertEqual(cfg["overlap_seconds"], 300)
         finally:
             shutil.rmtree(td)
 

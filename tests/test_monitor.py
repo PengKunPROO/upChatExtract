@@ -121,6 +121,20 @@ feishu:
                 }
             )
 
+    def test_negative_overlap_seconds_raises(self):
+        with self.assertRaises(ConfigError):
+            validate_config(
+                {
+                    "opus_id": "121",
+                    "up_uid": "1",
+                    "poll_interval": 60,
+                    "history_days": 3,
+                    "overlap_seconds": -1,
+                    "bilibili": {"sessdata": "s"},
+                    "feishu": {"webhook": "h"},
+                }
+            )
+
 
 # ============================================================================
 # State Tests
@@ -479,6 +493,26 @@ class TestRunOnce(unittest.TestCase):
             run_once(self.cfg, state, "121")
             sent = [c for c in mock_send.call_args_list if "新评论" in str(c[0][1])]
             self.assertEqual(len(sent), 1)
+
+    def test_hot_boot_rechecks_overlap_for_delayed_comment(self):
+        """接口延迟出现、ctime 早于上次轮询的评论仍应被去重窗口捕获。"""
+        state = {"pushed_ids": set(), "last_poll_ts": 2000, "boot_ts": 0}
+        delayed = self._c("delayed", 1995, "late visibility")
+        thresholds = []
+
+        def fake_fetch(sessdata, comment_id, up_uid, threshold, **kwargs):
+            thresholds.append(threshold)
+            return [delayed] if delayed["ctime"] >= threshold else []
+
+        with patch("monitor.fetch_up_comments", side_effect=fake_fetch), \
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.save_state"), \
+             patch("monitor._time.time", return_value=2100):
+            run_once(self.cfg, state, "121")
+
+        self.assertEqual(thresholds, [1700])
+        self.assertIn("delayed", state["pushed_ids"])
+        self.assertEqual(mock_send.call_count, 1)
 
     def test_failed_push_not_marked(self):
         state = default_state()

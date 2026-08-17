@@ -66,6 +66,7 @@ history_days: 3                 # 冷启动回溯天数
 push_interval: 2                # 连续推送间隔，秒
 fast_interval: 60               # 工作日 9:00-15:00 的快轮询间隔
 slow_interval: 300              # 其余时段的慢轮询间隔
+overlap_seconds: 300             # 增量轮询回看窗口，防止接口延迟导致漏抓
 
 bilibili:
   sessdata: "<你的SESSDATA>"    # 敏感，请勿公开/提交
@@ -77,7 +78,8 @@ feishu:
 ## 冷启动 / 热启动
 
 - **冷启动**（无 `state.json` 或手动删除）：推送近 `history_days` 天内 UP 的历史评论，然后是正常增量。
-- **热启动**（有 `state.json`）：纯增量，只推上次轮询之后的新评论。
+- **热启动**（有 `state.json`）：增量监控，通过评论 ID 去重，只推尚未推送的评论。
+- 热启动会重复检查最近 `overlap_seconds` 秒，并通过评论 ID 去重，避免 B 站接口延迟导致漏抓。
 - 删除 `state.json` = 重置，下次启动重新冷启动。
 
 ## 推送内容

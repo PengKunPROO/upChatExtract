@@ -18,6 +18,7 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+DEFAULT_OVERLAP_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,11 @@ def validate_config(cfg):
         val = cfg.get(key)
         if not isinstance(val, int) or val <= 0:
             raise ConfigError(f"配置项 {key} 必须为正整数，当前为 {val!r}")
+    overlap = cfg.get("overlap_seconds", DEFAULT_OVERLAP_SECONDS)
+    if not isinstance(overlap, int) or overlap < 0:
+        raise ConfigError(
+            f"配置项 overlap_seconds 必须为非负整数，当前为 {overlap!r}"
+        )
 
 
 def interactive_setup(path=None, input_fn=input, output_fn=print):
@@ -117,6 +123,7 @@ def interactive_setup(path=None, input_fn=input, output_fn=print):
         "push_interval": 2,
         "fast_interval": 60,
         "slow_interval": 300,
+        "overlap_seconds": DEFAULT_OVERLAP_SECONDS,
         "bilibili": {"sessdata": sessdata or "<未填写>"},
         "feishu": {"webhook": webhook or "<未填写>"},
     }
@@ -528,7 +535,10 @@ def run_once(cfg, state, comment_id):
         threshold = int(_time.time()) - cfg["history_days"] * 86400
         log.info("冷启动：回溯 %d 天，阈值 %s", cfg["history_days"], threshold)
     else:
-        threshold = state["last_poll_ts"]
+        # B站评论索引存在数秒到数分钟的可见性延迟。增量轮询保留一段
+        # 重叠窗口，再由 pushed_ids 去重，避免评论 ctime 早于水位而永久漏抓。
+        overlap = cfg.get("overlap_seconds", DEFAULT_OVERLAP_SECONDS)
+        threshold = max(0, state["last_poll_ts"] - overlap)
 
     try:
         comments = fetch_up_comments(
@@ -637,10 +647,11 @@ def main():
         log.error("解析 comment_id 失败: %s，将在循环中重试", e)
         comment_id = None
     log.info(
-        "监控 up_uid=%s 交易时段=%ds 非交易=%ds 冷启动=%s",
+        "监控 up_uid=%s 交易时段=%ds 非交易=%ds 增量回看=%ds 冷启动=%s",
         cfg["up_uid"],
         cfg.get("fast_interval", 60),
         cfg.get("slow_interval", 300),
+        cfg.get("overlap_seconds", DEFAULT_OVERLAP_SECONDS),
         state["last_poll_ts"] == 0,
     )
 

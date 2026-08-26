@@ -36,3 +36,24 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/up-chat-monitor.exe
+
+  # Win7 兼容版：Python 3.8 是最后一个支持 Windows 7 的 Python 版本
+  # （Python 3.9+ 依赖 Win8+ 才有的 api-ms-win-core-path-l1-1-0.dll）
+  release-win7:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Install deps
+        run: pip install -r requirements.txt "pyinstaller==5.13.2"
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --clean --onefile --console --name up-chat-monitor-win7 monitor.py
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/up-chat-monitor-win7.exe

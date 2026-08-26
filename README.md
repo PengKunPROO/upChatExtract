@@ -7,6 +7,7 @@
 ## 快速开始（最简单：直接下载 exe）
 
 1. 到本仓库 [Releases](../../releases) 页面下载最新版 `up-chat-monitor.exe`
+   - **Windows 7 用户**：请下载 `up-chat-monitor-win7.exe`（Python 3.8 构建，兼容 Win7；普通版在 Win7 上会报"丢失 api-ms-win-core-path-l1-1-0.dll"）
 2. 双击运行，首次启动会**自动打开图形配置窗口**，按提示填写 4 项信息：
    - **动态 opus ID**：动态页 `https://www.bilibili.com/opus/<这串数字>`
    - **UP主 mid**：UP主主页 `https://space.bilibili.com/<这串数字>`
@@ -60,7 +61,16 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm --clean --onefile --console --name up-chat-monitor monitor.py
 ```
 
-向本仓库推送 `v*` 标签会通过 GitHub Actions 自动编译并发布 Release。
+### 编译 Win7 兼容版
+
+需 Python 3.8（最后一个支持 Windows 7 的版本）和 PyInstaller 5.x：
+
+```bash
+pip install -r requirements.txt "pyinstaller==5.13.2"
+pyinstaller --noconfirm --clean --onefile --console --name up-chat-monitor-win7 monitor.py
+```
+
+向本仓库推送 `v*` 标签会通过 GitHub Actions 自动编译并发布 Release（同时包含普通版和 Win7 版两个 exe）。
 
 ## 配置文件说明
 

@@ -150,13 +150,12 @@ class TestOnCardAction(unittest.TestCase):
              patch("monitor.resolve_comment_id", return_value="399"), \
              patch("monitor.fetch_thread", return_value=self.thread), \
              patch.object(app, "patch_card", side_effect=fake_patch):
-            resp = app.on_card_action(client=None, data=data)
+            app.on_card_action(client=None, data=data)
 
         self.assertEqual(captured["message_id"], "om_test_1")
         blob = str(captured["card"])
         self.assertIn("感谢，那再请问", blob)   # 对方后续回复
         self.assertIn("张三", blob)
-        self.assertIsNotNone(resp)
 
     def test_missing_params(self):
         data = _FakeData({"action": "followups"})

@@ -22,6 +22,14 @@ from monitor import (
     send_feishu,
     run_once,
     setup_logging,
+    export_history,
+    analyze_mentioned_replies,
+    fetch_thread,
+    export_replies,
+    fetch_sub_replies_since,
+    build_followup_reply_card,
+    _add_watch,
+    _process_followups,
 )
 
 
@@ -519,6 +527,353 @@ class TestBuildComment(unittest.TestCase):
         raw = {"rpid": 1, "ctime": 1000, "message": "纯文本", "member": {"mid": "1"}}
         c = _build_comment(raw)
         self.assertEqual(c["message"], "纯文本")
+
+
+# ============================================================================
+# Export Tests
+# ============================================================================
+class TestExportHistory(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {
+            "opus_id": "121",
+            "up_uid": "888",
+            "bilibili": {"sessdata": "s"},
+            "feishu": {"webhook": "http://h"},
+        }
+
+    def _run(self, comments, sent_only=False, sent_ids=None, local=None):
+        td = tempfile.mkdtemp()
+        out = os.path.join(td, "out.md")
+        try:
+            with patch("monitor.resolve_comment_id", return_value="399"), \
+                 patch("monitor.fetch_up_comments", return_value=comments) as mock_f, \
+                 patch("monitor.load_state", return_value={"pushed_ids": set(sent_ids or [])}), \
+                 patch("monitor.load_sent_history", return_value=(local or {})):
+                path = export_history(self.cfg, out_path=out, sent_only=sent_only)
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            return path, content, mock_f
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_writes_markdown_with_content(self):
+        comments = [
+            {"rpid": "1", "ctime": 1730000000, "message": "第一条", "context": None, "uname": "UP"},
+            {"rpid": "2", "ctime": 1730003600, "message": "第二条\n换行", "context": "@某人: 原文", "uname": "UP"},
+        ]
+        path, content, _ = self._run(comments)
+        self.assertIn("# UP主评论汇总", content)
+        self.assertIn("共 2 条", content)
+        self.assertIn("第一条", content)
+        self.assertIn("第二条", content)
+        self.assertIn("@某人: 原文", content)
+        self.assertIn("121", content)  # opus 链接
+
+    def test_groups_by_date(self):
+        # 跨两天的评论
+        comments = [
+            {"rpid": "1", "ctime": 1730000000, "message": "第一天", "context": None, "uname": "UP"},
+            {"rpid": "2", "ctime": 1730090000, "message": "第二天", "context": None, "uname": "UP"},
+        ]
+        _, content, _ = self._run(comments)
+        dates = [ln for ln in content.splitlines() if ln.startswith("## ")]
+        self.assertEqual(len(dates), 2)
+
+    def test_passes_threshold_zero(self):
+        _, _, mock_f = self._run([])
+        self.assertEqual(mock_f.call_args.kwargs.get("threshold_ts"), 0)
+
+    def test_empty_comments(self):
+        path, content, _ = self._run([])
+        self.assertIn("共 0 条", content)
+
+    def test_sent_only_filters_by_pushed_ids(self):
+        comments = [
+            {"rpid": "1", "ctime": 1730000000, "message": "已发", "context": None, "uname": "UP"},
+            {"rpid": "2", "ctime": 1730003600, "message": "未发", "context": None, "uname": "UP"},
+        ]
+        _, content, _ = self._run(comments, sent_only=True, sent_ids=["1"])
+        self.assertIn("已发", content)
+        self.assertNotIn("未发", content)
+        self.assertIn("（已发送）", content)
+
+    def test_sent_only_includes_local_history(self):
+        # state 里没有，但本地历史里有 → 也算已发送
+        comments = [
+            {"rpid": "9", "ctime": 1730000000, "message": "本地记录", "context": None, "uname": "UP"},
+        ]
+        local = {"9": {"rpid": "9", "ctime": 1730000000, "message": "本地记录", "context": None, "uname": "UP"}}
+        _, content, _ = self._run(comments, sent_only=True, sent_ids=[], local=local)
+        self.assertIn("本地记录", content)
+
+    def test_record_sent_appends_jsonl(self):
+        from monitor import record_sent, load_sent_history
+        td = tempfile.mkdtemp()
+        try:
+            path = os.path.join(td, "sent_history.jsonl")
+            with patch("monitor.sent_history_path", return_value=path):
+                record_sent({"rpid": "123", "ctime": 1730000000, "message": "hi",
+                             "context": None, "uname": "UP"})
+                record_sent({"rpid": "124", "ctime": 1730000100, "message": "yo",
+                             "context": "@a: b", "uname": "UP"})
+                hist = load_sent_history()
+            self.assertEqual(len(hist), 2)
+            self.assertEqual(hist["123"]["message"], "hi")
+            self.assertEqual(hist["124"]["context"], "@a: b")
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+
+# ============================================================================
+# Conversation / Thread Tests
+# ============================================================================
+def _raw(rpid, mid, uname, ctime, message, parent=None):
+    d = {"rpid": rpid, "ctime": ctime,
+         "member": {"mid": mid, "uname": uname},
+         "content": {"message": message}}
+    if parent:
+        d["parent"] = parent
+    return d
+
+
+class TestAnalyzeMentionedReplies(unittest.TestCase):
+    UP = "888"
+
+    def _entry(self, rpid, mid, uname, ctime, msg, parent="", is_up=False):
+        return {"rpid": rpid, "mid": mid, "uname": uname, "ctime": ctime,
+                "message": msg, "parent": parent, "is_up": is_up}
+
+    def test_up_mention_then_target_reply(self):
+        thread = [
+            self._entry("r1", self.UP, "UP", 1000, "根"),
+            self._entry("u1", self.UP, "UP", 1100, "回复@张三: 你怎么看", parent="p1", is_up=True),
+            self._entry("x1", "999", "路人", 1150, "凑热闹"),
+            self._entry("p2", "111", "张三", 1200, "我觉得…"),      # 张三晚于 UP 的 @ → 采纳
+            self._entry("p0", "111", "张三", 900, "更早的话"),        # 早于 → 不采纳
+        ]
+        # 补上 parent 指向的张三原评论
+        thread.append(self._entry("p1", "111", "张三", 1050, "UP你觉得呢"))
+        ex = analyze_mentioned_replies(thread, self.UP)
+        self.assertEqual(len(ex), 1)
+        self.assertEqual(ex[0]["target_uname"], "张三")
+        got = [r["rpid"] for r in ex[0]["replies"]]
+        self.assertIn("p2", got)      # 晚于 @ 时间
+        self.assertNotIn("p0", got)   # 早于 @ 时间，排除
+        self.assertNotIn("x1", got)   # 路人，排除
+
+    def test_up_reply_to_self_excluded(self):
+        thread = [
+            self._entry("u1", self.UP, "UP", 1100, "接上条", parent="u0", is_up=True),
+            self._entry("u0", self.UP, "UP", 1000, "上条", is_up=True),
+        ]
+        self.assertEqual(analyze_mentioned_replies(thread, self.UP), [])
+
+    def test_pending_when_no_reply(self):
+        thread = [
+            self._entry("p1", "111", "张三", 1050, "问"),
+            self._entry("u1", self.UP, "UP", 1100, "@张三 答", parent="p1", is_up=True),
+        ]
+        ex = analyze_mentioned_replies(thread, self.UP)
+        self.assertEqual(len(ex), 1)
+        self.assertEqual(ex[0]["replies"], [])
+
+
+class TestCardV2(unittest.TestCase):
+    def test_context_in_collapsible_panel(self):
+        long_ctx = "完整上下文" * 30  # > 80 字
+        c = {"rpid": "1", "ctime": 1730000000, "message": "答", "context": long_ctx[:80] + "...",
+             "context_full": long_ctx, "uname": "UP"}
+        card = build_comment_card(c, opus_id="121")
+        self.assertEqual(card["card"]["schema"], "2.0")
+        blob = str(card)
+        self.assertIn("collapsible_panel", blob)
+        self.assertIn(long_ctx, blob)          # 完整上下文都在
+        self.assertIn("opus/121", blob)         # 可点链接
+
+    def test_reply_card_shows_replies_hint(self):
+        c = {"rpid": "1", "ctime": 1730000000, "message": "答", "context": "@张三: 问",
+             "context_full": "@张三: 问", "uname": "UP", "root_rpid": "316508517185"}
+        card = build_comment_card(c, opus_id="121")
+        blob = str(card)
+        self.assertIn("--replies 316508517185", blob)
+
+    def test_active_post_no_hint(self):
+        c = {"rpid": "1", "ctime": 1730000000, "message": "主动发", "context": None,
+             "context_full": None, "uname": "UP"}
+        card = build_comment_card(c)
+        self.assertNotIn("对话记录", str(card))
+        self.assertIn("（主动发布）", str(card))
+
+
+class TestFetchThread(unittest.TestCase):
+    def test_combines_root_and_subs(self):
+        root = _raw("r1", "888", "UP", 1000, "根评论")
+        sub1 = _raw("s1", "111", "张三", 1100, "问", parent="r1")
+        sub2 = _raw("s2", "888", "UP", 1200, "答", parent="s1")
+        page = {"code": 0, "data": {"cursor": {"is_end": True},
+                                    "top_replies": [root], "replies": [root]}}
+        reply_page = {"code": 0, "data": {"page": {"count": 2}, "replies": [sub1, sub2]}}
+
+        def _resp(data):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = data
+            return r
+
+        with patch("monitor.fetch_reply_page", return_value=page["data"]), \
+             patch("monitor._do_request", return_value=_resp(reply_page)):
+            thread = fetch_thread("s", "399", "r1", "888", opus_id="121")
+        self.assertEqual(len(thread), 3)
+        self.assertEqual(thread[0]["message"], "根评论")
+        self.assertTrue(thread[2]["is_up"])
+        self.assertEqual(thread[1]["parent"], "r1")
+
+
+class TestExportReplies(unittest.TestCase):
+    def test_writes_file_and_pushes(self):
+        cfg = {"opus_id": "121", "up_uid": "888",
+               "bilibili": {"sessdata": "s"}, "feishu": {"webhook": "http://h"}}
+        thread = [
+            {"rpid": "p1", "mid": "111", "uname": "张三", "ctime": 1000, "message": "问", "parent": "", "is_up": False},
+            {"rpid": "u1", "mid": "888", "uname": "UP", "ctime": 1100, "message": "@张三 答", "parent": "p1", "is_up": True},
+            {"rpid": "p2", "mid": "111", "uname": "张三", "ctime": 1200, "message": "回复UP", "parent": "u1", "is_up": False},
+        ]
+        td = tempfile.mkdtemp()
+        try:
+            out = os.path.join(td, "r.md")
+            with patch("monitor.resolve_comment_id", return_value="399"), \
+                 patch("monitor.fetch_thread", return_value=thread), \
+                 patch("monitor.send_feishu", return_value=True) as mock_send:
+                path = export_replies(cfg, "r1", out_path=out)
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            self.assertIn("UP @ 张三", content)
+            self.assertIn("回复UP", content)
+            self.assertEqual(mock_send.call_count, 1)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_empty_when_no_mention(self):
+        cfg = {"opus_id": "121", "up_uid": "888",
+               "bilibili": {"sessdata": "s"}, "feishu": {"webhook": "http://h"}}
+        thread = [{"rpid": "r1", "mid": "888", "uname": "UP", "ctime": 1000,
+                   "message": "根", "parent": "", "is_up": True}]
+        td = tempfile.mkdtemp()
+        try:
+            out = os.path.join(td, "r.md")
+            with patch("monitor.resolve_comment_id", return_value="399"), \
+                 patch("monitor.fetch_thread", return_value=thread), \
+                 patch("monitor.send_feishu", return_value=True):
+                path = export_replies(cfg, "r1", out_path=out)
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            self.assertIn("共 0 段", content)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+
+# ============================================================================
+# Follow-up (对方后续回复) Tests
+# ============================================================================
+class TestFollowupWatch(unittest.TestCase):
+    cfg = {"opus_id": "121", "up_uid": "888",
+           "bilibili": {"sessdata": "s"}, "feishu": {"webhook": "http://h"}}
+
+    def test_add_watch_and_dedup(self):
+        state = default_state()
+        c = {"rpid": "u1", "ctime": 1000, "message": "@张三 答", "uname": "UP",
+             "target_mid": "111", "target_uname": "张三", "root_rpid": "r1"}
+        _add_watch(state, c)
+        _add_watch(state, c)  # 重复不应再加
+        self.assertEqual(len(state["followup_watch"]), 1)
+
+    def test_add_watch_caps_at_30(self):
+        state = default_state()
+        for i in range(35):
+            _add_watch(state, {"rpid": f"u{i}", "ctime": i, "message": "x", "uname": "UP",
+                               "target_mid": "111", "target_uname": "张三", "root_rpid": "r1"})
+        self.assertEqual(len(state["followup_watch"]), 30)
+
+    def test_process_pushes_target_reply_only(self):
+        state = default_state()
+        state["followup_watch"] = [{
+            "root_rpid": "r1", "up_rpid": "u1", "up_ctime": 1000, "up_message": "@张三 答",
+            "up_uname": "UP", "target_mid": "111", "target_uname": "张三", "created": int(time.time()),
+        }]
+        sub = {"rpid": "p2", "ctime": 1200, "member": {"mid": "111", "uname": "张三"},
+               "content": {"message": "感谢"}}
+        other = {"rpid": "x1", "ctime": 1300, "member": {"mid": "999", "uname": "路人"},
+                 "content": {"message": "凑热闹"}}
+        with patch("monitor.fetch_sub_replies_since", return_value=[sub, other]), \
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.record_sent"), patch("monitor.save_state"):
+            _process_followups(self.cfg, state, "399")
+        self.assertIn("p2", state["pushed_ids"])
+        self.assertNotIn("x1", state["pushed_ids"])
+        self.assertEqual(mock_send.call_count, 1)
+
+    def test_process_skips_already_pushed(self):
+        state = default_state()
+        state["pushed_ids"].add("p2")
+        state["followup_watch"] = [{
+            "root_rpid": "r1", "up_rpid": "u1", "up_ctime": 1000, "up_message": "x",
+            "up_uname": "UP", "target_mid": "111", "target_uname": "张三", "created": int(time.time()),
+        }]
+        sub = {"rpid": "p2", "ctime": 1200, "member": {"mid": "111", "uname": "张三"},
+               "content": {"message": "感谢"}}
+        with patch("monitor.fetch_sub_replies_since", return_value=[sub]), \
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.record_sent"), patch("monitor.save_state"):
+            _process_followups(self.cfg, state, "399")
+        self.assertEqual(mock_send.call_count, 0)
+
+    def test_process_expires_old_watch(self):
+        state = default_state()
+        state["followup_watch"] = [{
+            "root_rpid": "r1", "up_rpid": "u1", "up_ctime": 1000, "up_message": "x",
+            "up_uname": "UP", "target_mid": "111", "target_uname": "张三",
+            "created": int(time.time()) - 10 * 86400,
+        }]
+        with patch("monitor.fetch_sub_replies_since") as mock_fetch, \
+             patch("monitor.save_state"):
+            _process_followups(self.cfg, state, "399")
+        mock_fetch.assert_not_called()
+        self.assertEqual(state["followup_watch"], [])
+
+
+class TestFollowupCard(unittest.TestCase):
+    def test_card_structure(self):
+        reply = {"rpid": "p2", "ctime": 1730000000, "message": "感谢", "uname": "张三"}
+        up = {"message": "@张三 我的看法", "uname": "UP", "root_rpid": "r1", "target_uname": "张三"}
+        card = build_followup_reply_card(reply, up, opus_id="121")
+        self.assertEqual(card["card"]["schema"], "2.0")
+        self.assertIn("张三", str(card))
+        self.assertIn("感谢", str(card))
+
+
+class TestFetchSubRepliesSince(unittest.TestCase):
+    def test_backward_collects_recent(self):
+        def _resp(data):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = data
+            return r
+
+        page1 = {"code": 0, "data": {"page": {"count": 40},
+                  "replies": [{"rpid": "old", "ctime": 100, "member": {"mid": "1"}, "content": {"message": "old"}}]}}
+        page2 = {"code": 0, "data": {"page": {"count": 40},
+                  "replies": [{"rpid": "new", "ctime": 2000, "member": {"mid": "1"}, "content": {"message": "new"}}]}}
+        # 调用顺序：count(page1) -> pn=2(page2) -> pn=1(page1)
+        with patch("monitor._do_request", side_effect=[_resp(page1), _resp(page2), _resp(page1)]), \
+             patch("monitor._time.sleep"):
+            out = fetch_sub_replies_since("s", "399", "r1", since_ctime=1000)
+        rpids = [s["rpid"] for s in out]
+        self.assertIn("new", rpids)
+        self.assertNotIn("old", rpids)
 
 
 if __name__ == "__main__":

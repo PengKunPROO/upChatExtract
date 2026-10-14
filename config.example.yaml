@@ -9,6 +9,7 @@ poll_start_hour: 9
 poll_end_hour: 15
 poll_weekday_only: true
 overlap_seconds: 1800
+followup_watch_days: 3    # UP主动@某人后，观察对方后续回复的天数
 
 bilibili:
   sessdata: "<从浏览器F12->Application->Cookies->bilibili.com复制SESSDATA>"

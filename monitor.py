@@ -145,7 +145,12 @@ def interactive_setup(path=None, input_fn=input, output_fn=print):
 # State
 # ---------------------------------------------------------------------------
 def default_state():
-    return {"pushed_ids": set(), "last_poll_ts": 0, "boot_ts": int(_time.time())}
+    return {
+        "pushed_ids": set(),
+        "last_poll_ts": 0,
+        "boot_ts": int(_time.time()),
+        "followup_watch": [],   # 待观察「对方后续回复」的 UP@ 评论
+    }
 
 
 def load_state(path=None):
@@ -159,6 +164,7 @@ def load_state(path=None):
         "pushed_ids": set(raw.get("pushed_ids", [])),
         "last_poll_ts": raw.get("last_poll_ts", 0),
         "boot_ts": raw.get("boot_ts", int(_time.time())),
+        "followup_watch": raw.get("followup_watch", []) or [],
     }
 
 
@@ -168,6 +174,7 @@ def save_state(state, path=None):
         "pushed_ids": sorted(state["pushed_ids"]),
         "last_poll_ts": state["last_poll_ts"],
         "boot_ts": state["boot_ts"],
+        "followup_watch": state.get("followup_watch", []),
     }
     dir_ = os.path.dirname(os.path.abspath(path) if os.path.dirname(path) else ".") or "."
     fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp", prefix="state_")
@@ -245,28 +252,35 @@ def _get_message(raw):
     return (content.get("message") or raw.get("message") or "").strip()
 
 
+def _truncate_context(msg, n=80):
+    if not msg:
+        return None
+    return msg if len(msg) <= n else msg[:n] + "..."
+
+
 def _build_comment(raw, parent=None):
     reply_to = raw.get("reply_to") or {}
     message = _get_message(raw)
     if raw.get("pictures"):
         message += "".join(" [图片]" for _ in raw["pictures"])
-    context = None
+    context_full = None
+    target_mid = ""
+    target_uname = ""
     if reply_to:
-        ctx_msg = _get_message(reply_to)
-        if len(ctx_msg) > 80:
-            ctx_msg = ctx_msg[:80] + "..."
-        context = ctx_msg or None
+        context_full = _get_message(reply_to) or None
     elif parent is not None:
-        ctx_msg = _get_message(parent)
-        if len(ctx_msg) > 80:
-            ctx_msg = ctx_msg[:80] + "..."
-        context = ctx_msg or None
+        context_full = _get_message(parent) or None
+        target_mid = str((parent.get("member") or {}).get("mid") or "")
+        target_uname = (parent.get("member") or {}).get("uname", "")
     return {
         "rpid": str(raw["rpid"]),
         "ctime": raw["ctime"],
         "message": message,
-        "context": context,
+        "context": _truncate_context(context_full),
+        "context_full": context_full,
         "uname": (raw.get("member") or {}).get("uname", ""),
+        "target_mid": target_mid,
+        "target_uname": target_uname,
     }
 
 
@@ -275,31 +289,33 @@ def _build_comment_with_context(raw, all_cache):
     message = _get_message(raw)
     if raw.get("pictures"):
         message += "".join(" [图片]" for _ in raw["pictures"])
-    context = None
+    context_full = None
+    target_mid = ""
+    target_uname = ""
     reply_to = raw.get("reply_to")
     if reply_to and _get_message(reply_to):
-        ctx_msg = _get_message(reply_to)
-        if len(ctx_msg) > 80:
-            ctx_msg = ctx_msg[:80] + "..."
-        context = ctx_msg
+        context_full = _get_message(reply_to)
     else:
         # reply_to 为空时，用 parent rpid 从缓存找被回复的评论
         parent_rpid = raw.get("parent")
         if parent_rpid and parent_rpid in all_cache:
             parent_raw = all_cache[parent_rpid]
             parent_uname = (parent_raw.get("member") or {}).get("uname", "")
+            target_mid = str((parent_raw.get("member") or {}).get("mid") or "")
+            target_uname = parent_uname
             ctx_msg = _get_message(parent_raw)
             if ctx_msg:
-                if len(ctx_msg) > 80:
-                    ctx_msg = ctx_msg[:80] + "..."
                 prefix = f"@{parent_uname}: " if parent_uname else ""
-                context = prefix + ctx_msg
+                context_full = prefix + ctx_msg
     return {
         "rpid": str(raw["rpid"]),
         "ctime": raw["ctime"],
         "message": message,
-        "context": context,
+        "context": _truncate_context(context_full),
+        "context_full": context_full,
         "uname": (raw.get("member") or {}).get("uname", ""),
+        "target_mid": target_mid,
+        "target_uname": target_uname,
     }
 
 
@@ -365,9 +381,63 @@ def fetch_sub_replies(sessdata, comment_id, root_rpid, up_uid, threshold_ts, max
     for rpid, s in all_cache.items():
         if str((s.get("member") or {}).get("mid")) == up_uid:
             c = _build_comment_with_context(s, all_cache)
+            c["root_rpid"] = str(root_rpid)
             if c["ctime"] >= threshold_ts:
                 results.append(c)
     return results
+
+
+def fetch_sub_replies_since(sessdata, comment_id, root_rpid, since_ctime, opus_id=None, max_pages=20):
+    """从最后一页往前翻，返回该楼中 ctime >= since_ctime 的子回复（所有人）。
+
+    子回复按时间正序，新回复在最后几页，所以从后往前翻很快。
+    """
+    out = []
+    referer = f"https://www.bilibili.com/opus/{opus_id}" if opus_id else "https://www.bilibili.com/"
+    headers = {
+        "User-Agent": UA,
+        "Cookie": f"SESSDATA={sessdata}",
+        "Referer": referer,
+    }
+    params = {"oid": comment_id, "type": 11, "root": root_rpid, "pn": 1, "ps": 20}
+    resp = _do_request("GET", REPLY_URL, headers=headers, params=params, timeout=15)
+    if resp.status_code != 200:
+        return out
+    try:
+        data = resp.json()
+    except Exception:
+        return out
+    if data.get("code") != 0:
+        return out
+    page = (data.get("data") or {}).get("page") or {}
+    total = page.get("count", 0)
+    if total == 0:
+        return out
+    total_pages = min((total + 19) // 20, max_pages)
+
+    for pn in range(total_pages, 0, -1):
+        if pn != total_pages:
+            _time.sleep(1)  # 防风控
+        params["pn"] = pn
+        resp = _do_request("GET", REPLY_URL, headers=headers, params=params, timeout=15)
+        if resp.status_code != 200:
+            break
+        try:
+            data = resp.json()
+        except Exception:
+            break
+        if data.get("code") != 0:
+            break
+        reps = (data.get("data") or {}).get("replies") or []
+        if not reps:
+            continue
+        newest = max((s.get("ctime", 0) for s in reps), default=0)
+        for s in reps:
+            if s.get("ctime", 0) >= since_ctime:
+                out.append(s)
+        if newest < since_ctime:
+            break  # 更早的页都是旧回复
+    return out
 
 
 def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=5, opus_id=None):
@@ -384,12 +454,14 @@ def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=5, o
             rpid = r.get("rpid")
             if str((r.get("member") or {}).get("mid")) == up_uid:
                 c = _build_comment(r)
+                c["root_rpid"] = str(rpid)
                 if c["ctime"] >= threshold_ts:
                     results.append(c)
             # 接口内嵌的子回复（前几条）
             for sub in r.get("replies") or []:
                 if str((sub.get("member") or {}).get("mid")) == up_uid:
                     c = _build_comment(sub, parent=r)
+                    c["root_rpid"] = str(rpid)
                     if c["ctime"] >= threshold_ts:
                         results.append(c)
             # 楼中楼接口拉全部子回复
@@ -415,49 +487,360 @@ def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=5, o
 
 
 # ---------------------------------------------------------------------------
+# Export & Sent History
+# ---------------------------------------------------------------------------
+def sent_history_path():
+    return os.path.join(base_dir(), "sent_history.jsonl")
+
+
+def record_sent(comment):
+    """推送成功后追加一条本地发送记录（jsonl），用于日后完整导出。"""
+    rec = {
+        "rpid": str(comment["rpid"]),
+        "ctime": comment["ctime"],
+        "message": comment["message"],
+        "context": comment.get("context"),
+        "uname": comment.get("uname", ""),
+        "sent_at": int(_time.time()),
+    }
+    try:
+        with open(sent_history_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("写入发送记录失败: %s", e)
+
+
+def load_sent_history():
+    """读取本地发送记录，返回 {rpid: comment}。"""
+    out = {}
+    try:
+        with open(sent_history_path(), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                out[str(rec.get("rpid"))] = {
+                    "rpid": str(rec.get("rpid")),
+                    "ctime": rec.get("ctime", 0),
+                    "message": rec.get("message", ""),
+                    "context": rec.get("context"),
+                    "uname": rec.get("uname", ""),
+                }
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _write_markdown(comments, cfg, out_path, title):
+    lines = [
+        f"# {title}",
+        "",
+        f"> UP主UID：{cfg['up_uid']}",
+        f"> 动态链接：https://www.bilibili.com/opus/{cfg['opus_id']}",
+        f"> 导出时间：{_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"> 共 {len(comments)} 条",
+        "",
+    ]
+    current_date = None
+    for c in comments:
+        date_str = _time.strftime("%Y-%m-%d", _time.localtime(c["ctime"]))
+        time_str = _time.strftime("%H:%M:%S", _time.localtime(c["ctime"]))
+        if date_str != current_date:
+            current_date = date_str
+            lines.extend([f"## {date_str}", ""])
+        if c.get("context"):
+            lines.append(f"**{time_str}**　（回复 {c['context']}）")
+        else:
+            lines.append(f"**{time_str}**")
+        lines.append("")
+        lines.append(c["message"])
+        lines.append("")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return out_path
+
+
+def export_history(cfg, out_path=None, sent_only=False):
+    """导出评论到本地 Markdown 文档。
+
+    sent_only=True 时只导出「已推送到飞书」的评论（state.json 的 pushed_ids
+    ∪ 本地 sent_history.jsonl）。
+    """
+    comment_id = resolve_comment_id(cfg["opus_id"])
+    fetched = fetch_up_comments(
+        cfg["bilibili"]["sessdata"],
+        comment_id,
+        cfg["up_uid"],
+        threshold_ts=0,
+        max_pages=10,
+        opus_id=cfg["opus_id"],
+    )
+
+    merged = {c["rpid"]: c for c in fetched}
+    local = load_sent_history()
+    for rpid, c in local.items():
+        merged.setdefault(rpid, c)  # 本地记录优先保留（B站可能已删）
+
+    if sent_only:
+        state = load_state()
+        sent_ids = set(state["pushed_ids"]) | set(local.keys())
+        comments = [c for c in merged.values() if c["rpid"] in sent_ids]
+        title = "UP主评论汇总（已发送）"
+    else:
+        comments = list(merged.values())
+        title = "UP主评论汇总"
+
+    comments.sort(key=lambda c: c["ctime"])
+    if out_path is None:
+        date_str = _time.strftime("%Y%m%d")
+        suffix = "已发送_" if sent_only else ""
+        out_path = os.path.join(base_dir(), f"评论汇总_{suffix}{date_str}.md")
+    return _write_markdown(comments, cfg, out_path, title)
+
+
+def fetch_thread(sessdata, comment_id, root_rpid, up_uid, opus_id=None, max_pages=50):
+    """拉取某一楼的完整对话：根评论 + 全部子回复（所有人），按时间升序。
+
+    返回 [{uname, message, ctime, is_up, mid}]。
+    """
+    headers = {
+        "User-Agent": UA,
+        "Cookie": f"SESSDATA={sessdata}",
+        "Referer": f"https://www.bilibili.com/opus/{opus_id}" if opus_id else "https://www.bilibili.com/",
+    }
+    thread = []
+    seen = set()
+
+    def _add(raw, is_root=False):
+        rpid = str(raw.get("rpid"))
+        if rpid in seen:
+            return
+        msg = _get_message(raw)
+        if not msg:
+            return
+        seen.add(rpid)
+        mid = str((raw.get("member") or {}).get("mid") or "")
+        thread.append({
+            "rpid": rpid,
+            "uname": (raw.get("member") or {}).get("uname", ""),
+            "message": msg,
+            "ctime": raw.get("ctime", 0),
+            "is_up": mid == up_uid,
+            "mid": mid,
+            "parent": str(raw.get("parent") or ""),
+            "is_root": is_root,
+        })
+
+    # 根评论：从 reply/main 里找
+    next_cursor = 0
+    for _ in range(5):
+        try:
+            data = fetch_reply_page(sessdata, comment_id, page=next_cursor)
+        except FetchError:
+            break
+        for r in (data.get("top_replies") or []) + (data.get("replies") or []):
+            if str(r.get("rpid")) == str(root_rpid):
+                _add(r, is_root=True)
+        cur = data.get("cursor") or {}
+        if cur.get("is_end"):
+            break
+        next_cursor = cur.get("next", 0)
+
+    # 全部子回复
+    for pn in range(1, max_pages + 1):
+        params = {"oid": comment_id, "type": 11, "root": root_rpid, "pn": pn, "ps": 20}
+        resp = _do_request("GET", REPLY_URL, headers=headers, params=params, timeout=15)
+        if resp.status_code != 200:
+            break
+        try:
+            data = resp.json()
+        except Exception:
+            break
+        if data.get("code") != 0:
+            break
+        replies = (data.get("data") or {}).get("replies") or []
+        if not replies:
+            break
+        for s in replies:
+            _add(s)
+        if len(replies) < 20:
+            break
+        _time.sleep(1)  # 防风控
+
+    thread.sort(key=lambda x: x["ctime"])
+    return thread
+
+
+def analyze_mentioned_replies(thread, up_uid):
+    """找出一楼里「UP 主动@某人」以及该人在 UP 这条消息之后的回复。
+
+    匹配规则：UP 的消息 m（其 parent 指向某人 X 的消息）为发起；
+    取 X 在该楼中 ctime 晚于 m.ctime 的回复。按时序返回：
+    [{up: entry, target_uname, target_mid, replies: [entry, ...]}]
+    """
+    by_rpid = {m["rpid"]: m for m in thread}
+    out = []
+    for m in thread:
+        if not m.get("is_up"):
+            continue
+        parent = by_rpid.get(m.get("parent"))
+        if not parent:
+            continue
+        if parent["mid"] == up_uid:  # UP 回复自己，不算 @ 别人
+            continue
+        target_mid = parent["mid"]
+        replies = [
+            x for x in thread
+            if x["mid"] == target_mid and x["ctime"] > m["ctime"]
+        ]
+        out.append({
+            "up": m,
+            "target_uname": parent.get("uname", ""),
+            "target_mid": target_mid,
+            "replies": replies,
+        })
+    out.sort(key=lambda x: x["up"]["ctime"])
+    return out
+
+
+def export_replies(cfg, root_rpid, out_path=None, push=True):
+    """按需拉取指定楼，提取「UP 主动@某人 → 对方后续回复」，存本地并推送。"""
+
+    def _fmt(m):
+        ts = _time.strftime("%m-%d %H:%M", _time.localtime(m["ctime"]))
+        who = (m.get("uname") or "?") + ("（UP主）" if m.get("is_up") else "")
+        return f"**{who}**　{ts}\n{m['message']}"
+
+    comment_id = resolve_comment_id(cfg["opus_id"])
+    thread = fetch_thread(
+        cfg["bilibili"]["sessdata"], comment_id, root_rpid,
+        cfg["up_uid"], opus_id=cfg["opus_id"],
+    )
+    exchanges = analyze_mentioned_replies(thread, cfg["up_uid"])
+
+    lines = [
+        f"# UP主动@对话 · 楼 {root_rpid}",
+        "",
+        f"> 动态链接：https://www.bilibili.com/opus/{cfg['opus_id']}",
+        f"> 导出时间：{_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"> 共 {len(exchanges)} 段",
+        "",
+    ]
+    for ex in exchanges:
+        t = _time.strftime("%m-%d %H:%M", _time.localtime(ex["up"]["ctime"]))
+        lines.extend([f"## UP @ {ex['target_uname']}（{t}）", "", _fmt(ex["up"]), ""])
+        if ex["replies"]:
+            for r in ex["replies"]:
+                lines.extend([_fmt(r), ""])
+        else:
+            lines.extend(["（对方尚未回复）", ""])
+
+    if out_path is None:
+        out_path = os.path.join(base_dir(), f"UP@对话_{root_rpid}.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    if push:
+        elements = [{
+            "tag": "markdown",
+            "content": (
+                f"**UP主动@对话**　{len(exchanges)} 段\n"
+                f"[在B站查看该动态](https://www.bilibili.com/opus/{cfg['opus_id']})"
+            ),
+        }]
+        if not exchanges:
+            elements.append({"tag": "markdown", "content": "本楼未发现 UP 主动@某人的对话。"})
+        for ex in exchanges:
+            panel_title = f"UP @ {ex['target_uname']} · {len(ex['replies'])} 条回复 · 点击展开"
+            body = _fmt(ex["up"])
+            if ex["replies"]:
+                body += "\n\n---\n\n" + "\n\n".join(_fmt(r) for r in ex["replies"])
+            else:
+                body += "\n\n---\n\n（对方尚未回复）"
+            elements.append(_collapsible_panel(panel_title, body))
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "schema": "2.0",
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"UP主动@对话 · 楼 {root_rpid}"},
+                    "template": "turquoise",
+                },
+                "body": {"elements": elements},
+            },
+        }
+        send_feishu(cfg["feishu"]["webhook"], payload)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Feishu Push
 # ---------------------------------------------------------------------------
-def build_comment_card(comment):
+def _collapsible_panel(title, content):
+    """飞书卡片 2.0 折叠面板：默认折叠，点击展开显示完整 content。"""
+    return {
+        "tag": "collapsible_panel",
+        "expanded": False,
+        "header": {
+            "title": {"tag": "markdown", "content": f"**{title}**"},
+            "vertical_align": "center",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "size": "16px 16px",
+            },
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
+        "border": {"color": "grey", "corner_radius": "5px"},
+        "elements": [{"tag": "markdown", "content": content}],
+    }
+
+
+def build_comment_card(comment, opus_id=None):
     ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(comment["ctime"]))
-    context_text = comment.get("context")
-    if context_text is None:
-        context_text = "（主动发布）"
     uname = comment.get("uname") or "UP"
+    context_full = comment.get("context_full") or comment.get("context")
+
+    elements = [{"tag": "markdown", "content": f"**时间**　{ts}"}]
+
+    if context_full:
+        preview = context_full if len(context_full) <= 80 else context_full[:80] + "..."
+        elements.append(_collapsible_panel("上下文 · 点击展开", f"**预览**：{preview}\n\n---\n\n{context_full}"))
+    else:
+        elements.append({"tag": "markdown", "content": "**上下文**　（主动发布）"})
+
+    elements.append({"tag": "markdown", "content": f"**内容**\n{comment['message']}"})
+
+    foot = []
+    if opus_id:
+        foot.append(f"[在B站查看该动态](https://www.bilibili.com/opus/{opus_id})")
+    root_rpid = comment.get("root_rpid")
+    if root_rpid:
+        foot.append(f"楼ID `{root_rpid}`")
+    if foot:
+        elements.append({"tag": "markdown", "content": "　".join(foot)})
+
+    # UP 回复了某人 → 提示可用命令按需查看对方的回复
+    if context_full and root_rpid:
+        elements.append({
+            "tag": "markdown",
+            "content": f"查看该楼「UP主动@对话」：`python monitor.py --replies {root_rpid}`",
+        })
+
     return {
         "msg_type": "interactive",
         "card": {
+            "schema": "2.0",
             "header": {
                 "title": {"tag": "plain_text", "content": f"{uname} 新评论"},
                 "template": "green",
             },
-            "elements": [
-                {
-                    "tag": "div",
-                    "fields": [
-                        {
-                            "is_short": True,
-                            "text": {
-                                "tag": "lark_md",
-                                "content": f"**时间**\n{ts}",
-                            },
-                        },
-                        {
-                            "is_short": True,
-                            "text": {
-                                "tag": "lark_md",
-                                "content": f"**上下文**\n{context_text}",
-                            },
-                        },
-                    ],
-                },
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**内容**\n{comment['message']}",
-                    },
-                },
-            ],
+            "body": {"elements": elements},
         },
     }
 
@@ -466,13 +849,12 @@ def build_alert_card(title, body):
     return {
         "msg_type": "interactive",
         "card": {
+            "schema": "2.0",
             "header": {
                 "title": {"tag": "plain_text", "content": title},
                 "template": "red",
             },
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": body}},
-            ],
+            "body": {"elements": [{"tag": "markdown", "content": body}]},
         },
     }
 
@@ -523,6 +905,108 @@ def setup_logging(log_path=None):
 # ---------------------------------------------------------------------------
 # Main Loop
 # ---------------------------------------------------------------------------
+def build_followup_reply_card(reply, up_comment, opus_id=None):
+    """对方在 UP 之后回复时的补充卡片。"""
+    ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(reply["ctime"]))
+    uname = reply.get("uname") or "对方"
+    target = up_comment.get("target_uname") or ""
+    elements = [{"tag": "markdown", "content": f"**时间**　{ts}"}]
+    elements.append(
+        _collapsible_panel(
+            "UP 的原评论 · 点击展开",
+            f"**{up_comment.get('uname','UP')}**：{up_comment['message']}",
+        )
+    )
+    elements.append({"tag": "markdown", "content": f"**{uname} 的回复**\n{reply['message']}"})
+    if opus_id and up_comment.get("root_rpid"):
+        elements.append({
+            "tag": "markdown",
+            "content": f"[在B站查看该动态](https://www.bilibili.com/opus/{opus_id})　楼ID `{up_comment['root_rpid']}`",
+        })
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "schema": "2.0",
+            "header": {
+                "title": {"tag": "plain_text", "content": f"「{uname}」回复了{('@'+target) if target else 'UP'}"},
+                "template": "orange",
+            },
+            "body": {"elements": elements},
+        },
+    }
+
+
+def _add_watch(state, c):
+    """把「UP 主动@某人」的评论加入待观察列表，用于后续检测对方回复。"""
+    watch = state.setdefault("followup_watch", [])
+    if any(e.get("up_rpid") == c["rpid"] for e in watch):
+        return
+    watch.append({
+        "root_rpid": c.get("root_rpid", ""),
+        "up_rpid": c["rpid"],
+        "up_ctime": c["ctime"],
+        "up_message": c["message"],
+        "up_uname": c.get("uname", ""),
+        "target_mid": c.get("target_mid", ""),
+        "target_uname": c.get("target_uname", ""),
+        "created": int(_time.time()),
+    })
+    if len(watch) > 30:  # 只保留最近 30 条
+        del watch[:-30]
+
+
+def _process_followups(cfg, state, comment_id):
+    """检查待观察列表：对方若在 UP 之后回复，补充推送一张卡片。"""
+    watch = state.get("followup_watch", [])
+    if not watch:
+        return
+    webhook = cfg["feishu"]["webhook"]
+    max_days = cfg.get("followup_watch_days", 3)
+    now = int(_time.time())
+    kept = []
+    for e in watch:
+        if now - e.get("created", now) > max_days * 86400:
+            continue  # 过期丢弃
+        if not e.get("target_mid") or not e.get("root_rpid"):
+            continue
+        try:
+            reps = fetch_sub_replies_since(
+                cfg["bilibili"]["sessdata"], comment_id, e["root_rpid"],
+                e["up_ctime"], opus_id=cfg["opus_id"],
+            )
+        except Exception as ex:
+            log.warning("检查后续回复失败 root=%s: %s", e["root_rpid"], ex)
+            kept.append(e)
+            continue
+        for s in reps:
+            mid = str((s.get("member") or {}).get("mid") or "")
+            rpid = str(s.get("rpid"))
+            if mid != e["target_mid"] or rpid in state["pushed_ids"]:
+                continue
+            reply = {
+                "rpid": rpid,
+                "ctime": s.get("ctime", 0),
+                "message": _get_message(s),
+                "context": _truncate_context(f"@{e.get('up_uname', 'UP')}: {e.get('up_message', '')}"),
+                "uname": (s.get("member") or {}).get("uname", ""),
+            }
+            up_comment = {
+                "message": e.get("up_message", ""),
+                "uname": e.get("up_uname", "UP"),
+                "root_rpid": e["root_rpid"],
+                "target_uname": e.get("target_uname", ""),
+            }
+            card = build_followup_reply_card(reply, up_comment, opus_id=cfg["opus_id"])
+            if send_feishu(webhook, card):
+                state["pushed_ids"].add(rpid)
+                record_sent(reply)
+                save_state(state)
+                log.info("补充推送「对方回复」rpid=%s（对象 %s）", rpid, e.get("target_uname"))
+        kept.append(e)
+    state["followup_watch"] = kept
+    save_state(state)
+
+
 def run_once(cfg, state, comment_id):
     sessdata = cfg["bilibili"]["sessdata"]
     up_uid = cfg["up_uid"]
@@ -574,16 +1058,22 @@ def run_once(cfg, state, comment_id):
 
     push_gap = cfg.get("push_interval", 2)
     for c in new_comments:
-        card = build_comment_card(c)
+        card = build_comment_card(c, opus_id=cfg["opus_id"])
         ok = send_feishu(webhook, card)
         if ok:
             state["pushed_ids"].add(c["rpid"])
+            record_sent(c)
+            if c.get("target_mid"):
+                _add_watch(state, c)   # UP 主动@了某人 → 观察对方后续回复
             save_state(state)
             log.info("推送成功 rpid=%s", c["rpid"])
             if len(new_comments) > 1:
                 _time.sleep(push_gap)
         else:
             log.warning("推送失败 rpid=%s，下轮重试", c["rpid"])
+
+    # 检查观察中的「对方后续回复」
+    _process_followups(cfg, state, comment_id)
 
     state["last_poll_ts"] = int(_time.time())
     save_state(state)
@@ -659,11 +1149,46 @@ def main():
     setup_logging()
     log.info("========== 启动 ==========")
     if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
-        print("用法: python monitor.py [--config] [--setup] [--help]")
-        print("  （无参数）  开始监控，config.yaml 不存在时自动打开配置窗口")
-        print("  --config   打开图形配置窗口（保存后开始监控）")
-        print("  --setup    运行终端配置向导（无人值守场景）")
-        print("  --help     显示本帮助")
+        print("用法: python monitor.py [--export] [--export-all] [--replies <楼ID>] [--config] [--setup] [--help]")
+        print("  （无参数）    开始监控，config.yaml 不存在时自动打开配置窗口")
+        print("  --export      导出已推送(已发送)的评论记录为本地 Markdown 文档")
+        print("  --export-all  导出UP主全部历史评论为本地 Markdown 文档")
+        print("  --replies <楼ID>  按需查看该楼里「UP主动@某人 → 对方回复」，存本地并推送到飞书")
+        print("  --config      打开图形配置窗口（保存后开始监控）")
+        print("  --setup       运行终端配置向导（无人值守场景）")
+        print("  --help        显示本帮助")
+        return
+    if "--replies" in sys.argv[1:]:
+        idx = sys.argv.index("--replies")
+        if idx + 1 >= len(sys.argv):
+            log.error("--replies 需要跟一个楼ID，例如：python monitor.py --replies 316508517185")
+            return
+        root_rpid = sys.argv[idx + 1]
+        try:
+            cfg = load_config()
+        except ConfigError as e:
+            log.error("%s", e)
+            return
+        log.info("正在拉取楼 %s，查找 UP 主动@对话...", root_rpid)
+        try:
+            out = export_replies(cfg, root_rpid)
+            log.info("已导出并推送到飞书：%s", out)
+        except Exception as e:
+            log.error("拉取失败: %s", e, exc_info=True)
+        return
+    if "--export" in sys.argv[1:] or "--export-all" in sys.argv[1:]:
+        sent_only = "--export-all" not in sys.argv[1:]
+        try:
+            cfg = load_config()
+        except ConfigError as e:
+            log.error("%s", e)
+            return
+        log.info("正在拉取评论，请稍候（含楼中楼，可能需要几分钟）...")
+        try:
+            out = export_history(cfg, sent_only=sent_only)
+            log.info("已导出到 %s", out)
+        except Exception as e:
+            log.error("导出失败: %s", e, exc_info=True)
         return
     if "--config" in sys.argv[1:]:
         _open_config_editor()

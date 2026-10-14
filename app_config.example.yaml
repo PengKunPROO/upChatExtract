@@ -1,0 +1,6 @@
+# 飞书自建应用配置（应用版机器人专用，与 config.yaml 分开）
+# 获取步骤见 README_app.md
+
+app_id: "<应用的 App ID，形如 cli_xxxxx>"
+app_secret: "<应用的 App Secret>"
+chat_id: "<目标群的 chat_id，形如 oc_xxxxx>"

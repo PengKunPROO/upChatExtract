@@ -1,5 +1,10 @@
 config.yaml
+app_config.yaml
 state.json
+sent_history.jsonl
+评论汇总_*.md
+UP@对话_*.md
+对话_*.md
 monitor.log
 __pycache__/
 .pytest_cache/

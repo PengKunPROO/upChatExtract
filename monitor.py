@@ -812,18 +812,29 @@ def _collapsible_panel(title, content):
     }
 
 
+def _build_context_element(context_full):
+    """上下文展示策略：
+    - 空           -> （主动发布）
+    - 短（<=80字） -> 直接一行显示，不折叠、不预览（避免预览与正文重复）
+    - 长（>80字）  -> 折叠面板：正文 = 预览 + 分隔线 + 全文；折叠时也可见预览
+    """
+    if not context_full:
+        return {"tag": "markdown", "content": "**上下文**　（主动发布）"}
+    if len(context_full) <= 80:
+        return {"tag": "markdown", "content": f"**上下文**\n{context_full}"}
+    preview = context_full[:80] + "..."
+    return _collapsible_panel(
+        f"上下文：{preview}", f"{context_full}"
+    )
+
+
 def build_comment_card(comment, opus_id=None):
     ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(comment["ctime"]))
     uname = comment.get("uname") or "UP"
     context_full = comment.get("context_full") or comment.get("context")
 
     elements = [{"tag": "markdown", "content": f"**时间**　{ts}"}]
-
-    if context_full:
-        preview = context_full if len(context_full) <= 80 else context_full[:80] + "..."
-        elements.append(_collapsible_panel("上下文 · 点击展开", f"**预览**：{preview}\n\n---\n\n{context_full}"))
-    else:
-        elements.append({"tag": "markdown", "content": "**上下文**　（主动发布）"})
+    elements.append(_build_context_element(context_full))
 
     elements.append({"tag": "markdown", "content": f"**内容**\n{comment['message']}"})
 

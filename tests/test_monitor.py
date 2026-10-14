@@ -692,7 +692,19 @@ class TestCardV2(unittest.TestCase):
         blob = str(card)
         self.assertIn("collapsible_panel", blob)
         self.assertIn(long_ctx, blob)          # 完整上下文都在
+        self.assertEqual(blob.count(long_ctx), 1)  # 且只出现一次
         self.assertIn("opus/121", blob)         # 可点链接
+
+    def test_short_context_inline_no_duplicate(self):
+        """短上下文：不折叠、不预览，只显示一次。"""
+        c = {"rpid": "1", "ctime": 1730000000, "message": "答",
+             "context": "@张三: 好的", "context_full": "@张三: 好的", "uname": "UP"}
+        card = build_comment_card(c)
+        blob = str(card)
+        self.assertIn("@张三: 好的", blob)
+        self.assertNotIn("预览", blob)               # 不出现"预览"
+        self.assertNotIn("collapsible_panel", blob)  # 不折叠
+        self.assertEqual(blob.count("@张三: 好的"), 1)  # 只出现一次
 
     def test_reply_card_shows_replies_hint(self):
         c = {"rpid": "1", "ctime": 1730000000, "message": "答", "context": "@张三: 问",

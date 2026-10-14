@@ -86,15 +86,7 @@ def build_comment_card_v2(comment, opus_id=None, extra_elements=None):
     root_rpid = comment.get("root_rpid")
 
     elements = [{"tag": "markdown", "content": f"**时间**　{ts}"}]
-    if context_full:
-        preview = context_full if len(context_full) <= 80 else context_full[:80] + "..."
-        elements.append(
-            monitor._collapsible_panel(
-                "上下文 · 点击展开", f"**预览**：{preview}\n\n---\n\n{context_full}"
-            )
-        )
-    else:
-        elements.append({"tag": "markdown", "content": "**上下文**　（主动发布）"})
+    elements.append(monitor._build_context_element(context_full))
 
     elements.append({"tag": "markdown", "content": f"**内容**\n{comment['message']}"})
 

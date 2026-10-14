@@ -200,14 +200,20 @@ class FetchError(Exception):
 
 
 NO_PROXY = {"http": None, "https": None}
+_PROXY_DISABLED = False   # 记录系统代理是否已知不可用（失败一次后后续直接直连）
 
 
 def _do_request(method, url, **kwargs):
-    """先走系统默认代理；遇到代理/SSL 错误自动绕过直连。"""
+    """优先走系统代理；一旦发现代理/SSL 不可用，本次运行后续请求直接直连（只提示一次）。"""
+    global _PROXY_DISABLED
+    if _PROXY_DISABLED:
+        kwargs["proxies"] = NO_PROXY
+        return requests.request(method, url, **kwargs)
     try:
         return requests.request(method, url, **kwargs)
     except (requests.exceptions.ProxyError, requests.exceptions.SSLError):
-        log.warning("系统代理失败，自动切换直连")
+        _PROXY_DISABLED = True
+        log.warning("系统代理不可用，本次运行后续请求改为直连")
         kwargs["proxies"] = NO_PROXY
         return requests.request(method, url, **kwargs)
 

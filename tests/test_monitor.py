@@ -6,6 +6,8 @@ import time
 import unittest
 from unittest.mock import patch, MagicMock
 
+import requests
+
 from monitor import (
     ConfigError,
     FetchError,
@@ -874,6 +876,51 @@ class TestFetchSubRepliesSince(unittest.TestCase):
         rpids = [s["rpid"] for s in out]
         self.assertIn("new", rpids)
         self.assertNotIn("old", rpids)
+
+
+class TestProxyFallback(unittest.TestCase):
+    """代理不可用时：只提示一次，后续请求直接直连。"""
+
+    def setUp(self):
+        import monitor
+        self.monitor = monitor
+        monitor._PROXY_DISABLED = False
+
+    def tearDown(self):
+        self.monitor._PROXY_DISABLED = False
+
+    def test_fallback_cached_and_logged_once(self):
+        calls = []
+
+        def fake_request(method, url, **kw):
+            calls.append(kw.get("proxies"))
+            if kw.get("proxies") is None:
+                raise requests.exceptions.ProxyError("blocked")
+            return "ok"
+
+        with patch("monitor.requests.request", side_effect=fake_request), \
+             patch("monitor.log.warning") as mock_warn:
+            self.monitor._do_request("GET", "http://x")
+            self.monitor._do_request("GET", "http://x")
+            self.monitor._do_request("GET", "http://x")
+
+        # 第 1 次 _do_request：None(失败) + NO_PROXY(成功)；之后两次：直接 NO_PROXY
+        self.assertEqual(
+            calls,
+            [None, self.monitor.NO_PROXY, self.monitor.NO_PROXY, self.monitor.NO_PROXY],
+        )
+        self.assertEqual(mock_warn.call_count, 1)
+
+    def test_uses_system_proxy_first_when_not_disabled(self):
+        seen = []
+
+        def fake_request(method, url, **kw):
+            seen.append(kw.get("proxies"))
+            return "ok"
+
+        with patch("monitor.requests.request", side_effect=fake_request):
+            self.monitor._do_request("GET", "http://x")
+        self.assertEqual(seen, [None])  # 未显式指定 proxies → 走系统默认
 
 
 if __name__ == "__main__":

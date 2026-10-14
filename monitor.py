@@ -458,9 +458,11 @@ def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=5, o
         oldest_in_page = min((r.get("ctime", 0) for r in all_replies), default=0)
         for r in all_replies:
             rpid = r.get("rpid")
-            if str((r.get("member") or {}).get("mid")) == up_uid:
+            root_author_mid = str((r.get("member") or {}).get("mid") or "")
+            if root_author_mid == up_uid:
                 c = _build_comment(r)
                 c["root_rpid"] = str(rpid)
+                c["root_author_mid"] = root_author_mid
                 if c["ctime"] >= threshold_ts:
                     results.append(c)
             # 接口内嵌的子回复（前几条）
@@ -468,6 +470,7 @@ def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=5, o
                 if str((sub.get("member") or {}).get("mid")) == up_uid:
                     c = _build_comment(sub, parent=r)
                     c["root_rpid"] = str(rpid)
+                    c["root_author_mid"] = root_author_mid
                     if c["ctime"] >= threshold_ts:
                         results.append(c)
             # 楼中楼接口拉全部子回复
@@ -476,6 +479,8 @@ def fetch_up_comments(sessdata, comment_id, up_uid, threshold_ts, max_pages=5, o
                 sub_replies = fetch_sub_replies(
                     sessdata, comment_id, rpid, up_uid, threshold_ts, opus_id=opus_id
                 )
+                for s in sub_replies:
+                    s["root_author_mid"] = root_author_mid
                 results.extend(sub_replies)
         cursor = data.get("cursor") or {}
         if cursor.get("is_end") or oldest_in_page < threshold_ts:
@@ -949,6 +954,7 @@ def _add_watch(state, c):
         return
     watch.append({
         "root_rpid": c.get("root_rpid", ""),
+        "root_author_mid": c.get("root_author_mid", ""),
         "up_rpid": c["rpid"],
         "up_ctime": c["ctime"],
         "up_message": c["message"],
@@ -984,11 +990,30 @@ def _process_followups(cfg, state, comment_id):
             log.warning("检查后续回复失败 root=%s: %s", e["root_rpid"], ex)
             kept.append(e)
             continue
+        # 建立 rpid -> raw 映射，用于判断某条回复到底在回复谁
+        by_rpid = {str(s.get("rpid")): s for s in reps}
+        up_rpid = str(e.get("up_rpid", ""))
+        root_rpid = str(e.get("root_rpid", ""))
+        root_is_up = str(e.get("root_author_mid", "")) == str(cfg["up_uid"])
+        up_uid = cfg["up_uid"]
         for s in reps:
             mid = str((s.get("member") or {}).get("mid") or "")
             rpid = str(s.get("rpid"))
             if mid != e["target_mid"] or rpid in state["pushed_ids"]:
                 continue
+            # 只保留「确实在回复 UP」的发言：
+            #   - 直接回复 UP 的某条评论（含那条 @ 评论本身），或
+            #   - 回复根评论且根评论是 UP 发的
+            parent_rpid = str(s.get("parent") or "")
+            parent = by_rpid.get(parent_rpid)
+            parent_mid = str((parent.get("member") or {}).get("mid") or "") if parent else ""
+            is_reply_to_up = (
+                parent_rpid == up_rpid
+                or parent_mid == up_uid
+                or (parent_rpid == root_rpid and root_is_up)
+            )
+            if not is_reply_to_up:
+                continue  # 这条是在回复别人（不是回复 UP），不跟踪
             reply = {
                 "rpid": rpid,
                 "ctime": s.get("ctime", 0),

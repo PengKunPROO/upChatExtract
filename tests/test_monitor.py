@@ -800,23 +800,83 @@ class TestFollowupWatch(unittest.TestCase):
                                "target_mid": "111", "target_uname": "张三", "root_rpid": "r1"})
         self.assertEqual(len(state["followup_watch"]), 30)
 
-    def test_process_pushes_target_reply_only(self):
+    def test_process_pushes_only_reply_to_up(self):
         state = default_state()
         state["followup_watch"] = [{
             "root_rpid": "r1", "up_rpid": "u1", "up_ctime": 1000, "up_message": "@张三 答",
             "up_uname": "UP", "target_mid": "111", "target_uname": "张三", "created": int(time.time()),
         }]
-        sub = {"rpid": "p2", "ctime": 1200, "member": {"mid": "111", "uname": "张三"},
-               "content": {"message": "感谢"}}
+        up_msg = {"rpid": "u1", "ctime": 1000, "member": {"mid": "888", "uname": "UP"},
+                  "content": {"message": "@张三 答"}}
+        # 张三回复 UP 的 @ 评论 → 要
+        to_up = {"rpid": "p2", "ctime": 1200, "parent": "u1",
+                 "member": {"mid": "111", "uname": "张三"}, "content": {"message": "感谢"}}
+        # 张三回复别人（parent 指向路人）→ 不要
+        to_other = {"rpid": "p3", "ctime": 1250, "parent": "x9",
+                    "member": {"mid": "111", "uname": "张三"}, "content": {"message": "回你"}}
+        # 路人发言 → 不是对象 → 不要
         other = {"rpid": "x1", "ctime": 1300, "member": {"mid": "999", "uname": "路人"},
                  "content": {"message": "凑热闹"}}
-        with patch("monitor.fetch_sub_replies_since", return_value=[sub, other]), \
+        with patch("monitor.fetch_sub_replies_since", return_value=[up_msg, to_up, to_other, other]), \
              patch("monitor.send_feishu", return_value=True) as mock_send, \
              patch("monitor.record_sent"), patch("monitor.save_state"):
             _process_followups(self.cfg, state, "399")
         self.assertIn("p2", state["pushed_ids"])
+        self.assertNotIn("p3", state["pushed_ids"])   # 回复别人的，排除
         self.assertNotIn("x1", state["pushed_ids"])
         self.assertEqual(mock_send.call_count, 1)
+
+    def test_process_skips_other_person_reply(self):
+        """对象回复了别人（parent 的 mid 不是 UP）→ 不推送。"""
+        state = default_state()
+        state["followup_watch"] = [{
+            "root_rpid": "r1", "up_rpid": "u1", "up_ctime": 1000, "up_message": "@张三 答",
+            "up_uname": "UP", "target_mid": "111", "target_uname": "张三", "created": int(time.time()),
+        }]
+        peer = {"rpid": "x9", "ctime": 1100, "member": {"mid": "999", "uname": "路人"},
+                "content": {"message": "我问"}}
+        to_other = {"rpid": "p3", "ctime": 1250, "parent": "x9",
+                    "member": {"mid": "111", "uname": "张三"}, "content": {"message": "回你"}}
+        with patch("monitor.fetch_sub_replies_since", return_value=[peer, to_other]), \
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.record_sent"), patch("monitor.save_state"):
+            _process_followups(self.cfg, state, "399")
+        self.assertEqual(mock_send.call_count, 0)
+        self.assertNotIn("p3", state["pushed_ids"])
+
+    def test_process_keeps_reply_to_root_when_root_is_up(self):
+        """回复根评论、且根评论是 UP 发的 → 算回复 UP，保留。"""
+        state = default_state()
+        state["followup_watch"] = [{
+            "root_rpid": "r1", "root_author_mid": "888", "up_rpid": "u1", "up_ctime": 1000,
+            "up_message": "@张三 答", "up_uname": "UP", "target_mid": "111",
+            "target_uname": "张三", "created": int(time.time()),
+        }]
+        sub = {"rpid": "p4", "ctime": 1400, "parent": "r1",
+               "member": {"mid": "111", "uname": "张三"}, "content": {"message": "回复根"}}
+        with patch("monitor.fetch_sub_replies_since", return_value=[sub]), \
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.record_sent"), patch("monitor.save_state"):
+            _process_followups(self.cfg, state, "399")
+        self.assertIn("p4", state["pushed_ids"])
+        self.assertEqual(mock_send.call_count, 1)
+
+    def test_process_skips_reply_to_root_when_root_not_up(self):
+        """回复根评论、但根评论不是 UP 发的 → 排除。"""
+        state = default_state()
+        state["followup_watch"] = [{
+            "root_rpid": "r1", "root_author_mid": "999", "up_rpid": "u1", "up_ctime": 1000,
+            "up_message": "@张三 答", "up_uname": "UP", "target_mid": "111",
+            "target_uname": "张三", "created": int(time.time()),
+        }]
+        sub = {"rpid": "p4", "ctime": 1400, "parent": "r1",
+               "member": {"mid": "111", "uname": "张三"}, "content": {"message": "回复根"}}
+        with patch("monitor.fetch_sub_replies_since", return_value=[sub]), \
+             patch("monitor.send_feishu", return_value=True) as mock_send, \
+             patch("monitor.record_sent"), patch("monitor.save_state"):
+            _process_followups(self.cfg, state, "399")
+        self.assertNotIn("p4", state["pushed_ids"])
+        self.assertEqual(mock_send.call_count, 0)
 
     def test_process_skips_already_pushed(self):
         state = default_state()
@@ -825,8 +885,8 @@ class TestFollowupWatch(unittest.TestCase):
             "root_rpid": "r1", "up_rpid": "u1", "up_ctime": 1000, "up_message": "x",
             "up_uname": "UP", "target_mid": "111", "target_uname": "张三", "created": int(time.time()),
         }]
-        sub = {"rpid": "p2", "ctime": 1200, "member": {"mid": "111", "uname": "张三"},
-               "content": {"message": "感谢"}}
+        sub = {"rpid": "p2", "ctime": 1200, "parent": "u1",
+               "member": {"mid": "111", "uname": "张三"}, "content": {"message": "感谢"}}
         with patch("monitor.fetch_sub_replies_since", return_value=[sub]), \
              patch("monitor.send_feishu", return_value=True) as mock_send, \
              patch("monitor.record_sent"), patch("monitor.save_state"):
